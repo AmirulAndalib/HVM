@@ -1,6 +1,11 @@
 #define INTERPRETED
 #define WITHOUT_MAIN
-//#define DEBUG
+
+#ifdef DEBUG
+  #define debug(...) printf(__VA_ARGS__)
+#else
+  #define debug(...)
+#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -16,9 +21,6 @@ typedef  int32_t i32;
 typedef    float f32;
 typedef   double f64;
 typedef unsigned long long int u64;
-
-#define FALSE false
-#define TRUE  true
 
 // Configuration
 // -------------
@@ -215,33 +217,6 @@ struct Book {
 // Static Book
 __device__ Book BOOK;
 
-// Readback: λ-Encoded Ctr
-struct Ctr {
-  u32  tag;
-  u32  args_len;
-  Port args_buf[16];
-};
-
-// Readback: λ-Encoded Str (UTF-32)
-// FIXME: this is actually ASCII :|
-// FIXME: remove len limit
-struct Str {
-  u32  text_len;
-  char text_buf[256];
-};
-
-// IO Magic Number
-#define IO_MAGIC_0 0xD0CA11
-#define IO_MAGIC_1 0xFF1FF1
-
-// IO Tags
-#define IO_DONE 0
-#define IO_CALL 1
-
-// List Type
-#define LIST_NIL  0
-#define LIST_CONS 1
-
 // Debugger
 // --------
 
@@ -261,6 +236,11 @@ __global__ void print_heatmap(GNet* gnet, u32 turn);
 
 // Utils
 // -----
+
+__device__ __host__ f32 clamp(f32 x, f32 min, f32 max) {
+  const f32 t = x < min ? min : x;
+  return (t > max) ? max : t;
+}
 
 // TODO: write a time64() function that returns the time as fast as possible as a u64
 static inline u64 time64() {
@@ -541,6 +521,58 @@ __device__ __host__ inline Tag get_typ(Numb word) {
   return word & 0x1F;
 }
 
+__device__ __host__ inline bool is_num(Numb word) {
+  return get_typ(word) >= TY_U24 && get_typ(word) <= TY_F24;
+}
+
+__device__ __host__ inline bool is_cast(Numb word) {
+  return get_typ(word) == TY_SYM && get_sym(word) >= TY_U24 && get_sym(word) <= TY_F24;
+}
+
+// Cast a number to another type.
+// The semantics are meant to spiritually resemble rust's numeric casts:
+// - i24 <-> u24: is just reinterpretation of bits
+// - f24  -> i24,
+//   f24  -> u24: casts to the "closest" integer representing this float,
+//                saturating if out of range and 0 if NaN
+// - i24  -> f24,
+//   u24  -> f24: casts to the "closest" float representing this integer.
+__device__ __host__ inline Numb cast(Numb a, Numb b) {
+  if (get_sym(a) == TY_U24 && get_typ(b) == TY_U24) return b;
+  if (get_sym(a) == TY_U24 && get_typ(b) == TY_I24) {
+    // reinterpret bits
+    i32 val = get_i24(b);
+    return new_u24(*(u32*) &val);
+  }
+  if (get_sym(a) == TY_U24 && get_typ(b) == TY_F24) {
+    f32 val = get_f24(b);
+    if (isnan(val)) {
+      return new_u24(0);
+    }
+    return new_u24((u32) clamp(val, 0.0, 16777215));
+  }
+
+  if (get_sym(a) == TY_I24 && get_typ(b) == TY_U24) {
+    // reinterpret bits
+    u32 val = get_u24(b);
+    return new_i24(*(i32*) &val);
+  }
+  if (get_sym(a) == TY_I24 && get_typ(b) == TY_I24) return b;
+  if (get_sym(a) == TY_I24 && get_typ(b) == TY_F24) {
+    f32 val = get_f24(b);
+    if (isnan(val)) {
+      return new_i24(0);
+    }
+    return new_i24((i32) clamp(val, -8388608.0, 8388607.0));
+  }
+
+  if (get_sym(a) == TY_F24 && get_typ(b) == TY_U24) return new_f24((f32) get_u24(b));
+  if (get_sym(a) == TY_F24 && get_typ(b) == TY_I24) return new_f24((f32) get_i24(b));
+  if (get_sym(a) == TY_F24 && get_typ(b) == TY_F24) return b;
+
+  return new_u24(0);
+}
+
 // Partial application
 __device__ __host__ inline Numb partial(Numb a, Numb b) {
   return (b & ~0x1F) | get_sym(a);
@@ -552,6 +584,12 @@ __device__ __host__ inline Numb operate(Numb a, Numb b) {
   Tag bt = get_typ(b);
   if (at == TY_SYM && bt == TY_SYM) {
     return new_u24(0);
+  }
+  if (is_cast(a) && is_num(b)) {
+    return cast(a, b);
+  }
+  if (is_cast(b) && is_num(a)) {
+    return cast(b, a);
   }
   if (at == TY_SYM && bt != TY_SYM) {
     return partial(a, b);
@@ -640,6 +678,8 @@ __device__ __host__ inline Numb operate(Numb a, Numb b) {
         case OP_AND: return new_f24(atan2f(av, bv));
         case OP_OR:  return new_f24(logf(bv) / logf(av));
         case OP_XOR: return new_f24(powf(av, bv));
+        case OP_SHL: return new_f24(sin(av + bv));
+        case OP_SHR: return new_f24(tan(av + bv));
         default:     return new_f24(0);
       }
     }
@@ -666,11 +706,19 @@ __device__ u32 rbag_has_highs(RBag* rbag) {
 }
 
 __device__ void push_redex(TM* tm, Pair redex) {
+  #ifdef DEBUG
+  bool free_hi = tm->rbag.hi_end < RLEN;
+  bool free_lo = tm->rbag.lo_end < RLEN;
+  if (!free_hi || !free_lo) {
+    debug("push_redex: limited resources, maybe corrupting memory\n");
+  }
+  #endif
+
   Rule rule = get_pair_rule(redex);
   if (is_high_priority(rule)) {
-    tm->rbag.hi_buf[tm->rbag.hi_end++ % RLEN] = redex;
+    tm->rbag.hi_buf[tm->rbag.hi_end++] = redex;
   } else {
-    tm->rbag.lo_buf[tm->rbag.lo_end++ % RLEN] = redex;
+    tm->rbag.lo_buf[tm->rbag.lo_end++] = redex;
   }
 }
 
@@ -830,7 +878,7 @@ __device__ inline Port vars_take(Net* net, u32 var) {
 // ---------
 
 template <typename A>
-__device__ u32 g_alloc_1(Net* net, TM* tm, u32* g_put, A* g_buf) {
+__device__ u32 g_alloc_1(Net* net, u32* g_put, A* g_buf) {
   u32 lps = 0;
   while (true) {
     u32 lc = GID()*(G_NODE_LEN/TPG) + (*g_put%(G_NODE_LEN/TPG));
@@ -845,7 +893,7 @@ __device__ u32 g_alloc_1(Net* net, TM* tm, u32* g_put, A* g_buf) {
 }
 
 template <typename A>
-__device__ u32 g_alloc(Net* net, TM* tm, u32* ret, u32* g_put, A* g_buf, u32 num) {
+__device__ u32 g_alloc(Net* net, u32* ret, u32* g_put, A* g_buf, u32 num) {
   u32 got = 0;
   u32 lps = 0;
   while (got < num) {
@@ -855,6 +903,7 @@ __device__ u32 g_alloc(Net* net, TM* tm, u32* ret, u32* g_put, A* g_buf, u32 num
     if (lc >= L_NODE_LEN && elem == 0) {
       ret[got++] = lc;
     }
+
     if (++lps >= G_NODE_LEN/TPG) printf("OOM\n"); // FIXME: remove
     //assert(++lps < G_NODE_LEN/TPG); // FIXME: enable?
   }
@@ -863,7 +912,7 @@ __device__ u32 g_alloc(Net* net, TM* tm, u32* ret, u32* g_put, A* g_buf, u32 num
 }
 
 template <typename A>
-__device__ u32 l_alloc(Net* net, TM* tm, u32* ret, u32* l_put, A* l_buf, u32 num) {
+__device__ u32 l_alloc(Net* net, u32* ret, u32* l_put, A* l_buf, u32 num) {
   u32 got = 0;
   u32 lps = 0;
   while (got < num) {
@@ -880,7 +929,7 @@ __device__ u32 l_alloc(Net* net, TM* tm, u32* ret, u32* l_put, A* l_buf, u32 num
 }
 
 template <typename A>
-__device__ u32 l_alloc_1(Net* net, TM* tm, u32* ret, u32* l_put, A* l_buf, u32* lps) {
+__device__ u32 l_alloc_1(Net* net, u32* ret, u32* l_put, A* l_buf, u32* lps) {
   u32 got = 0;
   while (true) {
     u32 lc = ((*l_put)++ * TPB) % L_NODE_LEN + TID();
@@ -895,41 +944,41 @@ __device__ u32 l_alloc_1(Net* net, TM* tm, u32* ret, u32* l_put, A* l_buf, u32* 
   return got;
 }
 
-__device__ u32 g_node_alloc_1(Net* net, TM* tm) {
-  return g_alloc_1(net, tm, net->g_node_put, net->g_node_buf);
+__device__ u32 g_node_alloc_1(Net* net) {
+  return g_alloc_1(net, net->g_node_put, net->g_node_buf);
 }
 
-__device__ u32 g_vars_alloc_1(Net* net, TM* tm) {
-  return g_alloc_1(net, tm, net->g_vars_put, net->g_vars_buf);
+__device__ u32 g_vars_alloc_1(Net* net) {
+  return g_alloc_1(net, net->g_vars_put, net->g_vars_buf);
 }
 
 __device__ u32 g_node_alloc(Net* net, TM* tm, u32 num) {
-  return g_alloc(net, tm, tm->nloc, net->g_node_put, net->g_node_buf, num);
+  return g_alloc(net, tm->nloc, net->g_node_put, net->g_node_buf, num);
 }
 
 __device__ u32 g_vars_alloc(Net* net, TM* tm, u32 num) {
-  return g_alloc(net, tm, tm->vloc, net->g_vars_put, net->g_vars_buf, num);
+  return g_alloc(net, tm->vloc, net->g_vars_put, net->g_vars_buf, num);
 }
 
 __device__ u32 l_node_alloc(Net* net, TM* tm, u32 num) {
-  return l_alloc(net, tm, tm->nloc, &tm->nput, net->l_node_buf, num);
+  return l_alloc(net, tm->nloc, &tm->nput, net->l_node_buf, num);
 }
 
 __device__ u32 l_vars_alloc(Net* net, TM* tm, u32 num) {
-  return l_alloc(net, tm, tm->vloc, &tm->vput, net->l_vars_buf, num);
+  return l_alloc(net, tm->vloc, &tm->vput, net->l_vars_buf, num);
 }
 
 __device__ u32 l_node_alloc_1(Net* net, TM* tm, u32* lps) {
-  return l_alloc_1(net, tm, tm->nloc, &tm->nput, net->l_node_buf, lps);
+  return l_alloc_1(net, tm->nloc, &tm->nput, net->l_node_buf, lps);
 }
 
 __device__ u32 l_vars_alloc_1(Net* net, TM* tm, u32* lps) {
-  return l_alloc_1(net, tm, tm->vloc, &tm->vput, net->l_vars_buf, lps);
+  return l_alloc_1(net, tm->vloc, &tm->vput, net->l_vars_buf, lps);
 }
 
 __device__ u32 node_alloc_1(Net* net, TM* tm, u32* lps) {
   if (tm->mode != WORK) {
-    return g_node_alloc_1(net, tm);
+    return g_node_alloc_1(net);
   } else {
     return l_node_alloc_1(net, tm, lps);
   }
@@ -937,7 +986,7 @@ __device__ u32 node_alloc_1(Net* net, TM* tm, u32* lps) {
 
 __device__ u32 vars_alloc_1(Net* net, TM* tm, u32* lps) {
   if (tm->mode != WORK) {
-    return g_vars_alloc_1(net, tm);
+    return g_vars_alloc_1(net);
   } else {
     return l_vars_alloc_1(net, tm, lps);
   }
@@ -947,7 +996,7 @@ __device__ u32 vars_alloc_1(Net* net, TM* tm, u32* lps) {
 // -------
 
 // Finds a variable's value.
-__device__ inline Port peek(Net* net, TM* tm, Port var) {
+__device__ inline Port peek(Net* net, Port var) {
   while (get_tag(var) == VAR) {
     Port val = vars_load(net, get_val(var));
     if (val == NONE) break;
@@ -958,7 +1007,7 @@ __device__ inline Port peek(Net* net, TM* tm, Port var) {
 }
 
 // Finds a variable's value.
-__device__ inline Port enter(Net* net, TM* tm, Port var) {
+__device__ inline Port enter(Net* net, Port var) {
   u32 lps = 0;
   Port init = var;
   // While `B` is VAR: extend it (as an optimization)
@@ -1004,7 +1053,7 @@ __device__ void link(Net* net, TM* tm, Port A, Port B) {
     }
 
     // While `B` is VAR: extend it (as an optimization)
-    B = enter(net, tm, B);
+    B = enter(net, B);
 
     // Since `A` is VAR: point `A ~> B`.
     if (true) {
@@ -1057,11 +1106,13 @@ __device__ void link_pair(Net* net, TM* tm, Pair AB) {
 // ---------
 
 // Gets the necessary resources for an interaction.
-__device__ bool get_resources(Net* net, TM* tm, u8 need_rbag, u8 need_node, u8 need_vars) {
+__device__ bool get_resources(Net* net, TM* tm, u32 need_rbag, u32 need_node, u32 need_vars) {
   u32 got_rbag = min(RLEN - tm->rbag.lo_end, RLEN - tm->rbag.hi_end);
   u32 got_node;
   u32 got_vars;
   if (tm->mode != WORK) {
+    debug("allocating need_rbag=%u need_node=%u need_vars=%u\n", need_rbag, need_node, need_vars);
+
     got_node = g_node_alloc(net, tm, need_node);
     got_vars = g_vars_alloc(net, tm, need_vars);
   } else {
@@ -1092,13 +1143,13 @@ __device__ bool interact_link(Net* net, TM* tm, Port a, Port b) {
 
     // Loads ports.
     Pair l_b  = node_take(net, get_val(b));
-    Port l_b1 = enter(net, tm, get_fst(l_b));
-    Port l_b2 = enter(net, tm, get_snd(l_b));
+    Port l_b1 = enter(net, get_fst(l_b));
+    Port l_b2 = enter(net, get_snd(l_b));
 
     // Leaks port 1.
     Port g_b1;
     if (is_local(l_b1)) {
-      g_b1 = new_port(VAR, g_vars_alloc_1(net, tm));
+      g_b1 = new_port(VAR, g_vars_alloc_1(net));
       vars_create(net, get_val(g_b1), NONE);
       link_pair(net, tm, new_pair(g_b1, l_b1));
     } else {
@@ -1108,7 +1159,7 @@ __device__ bool interact_link(Net* net, TM* tm, Port a, Port b) {
     // Leaks port 2.
     Port g_b2;
     if (is_local(l_b2)) {
-      g_b2 = new_port(VAR, g_vars_alloc_1(net, tm));
+      g_b2 = new_port(VAR, g_vars_alloc_1(net));
       vars_create(net, get_val(g_b2), NONE);
       link_pair(net, tm, new_pair(g_b2, l_b2));
     } else {
@@ -1116,7 +1167,7 @@ __device__ bool interact_link(Net* net, TM* tm, Port a, Port b) {
     }
 
     // Leaks node.
-    Port g_b = new_port(get_tag(b), g_node_alloc_1(net, tm));
+    Port g_b = new_port(get_tag(b), g_node_alloc_1(net));
     node_create(net, get_val(g_b), new_pair(g_b1, g_b2));
     link_pair(net, tm, new_pair(a, g_b));
 
@@ -1271,7 +1322,7 @@ __device__ bool interact_oper(Net* net, TM* tm, Port a, Port b) {
   Val  av = get_val(a);
   Pair B  = node_take(net, get_val(b));
   Port B1 = get_fst(B);
-  Port B2 = enter(net, tm, get_snd(B));
+  Port B2 = enter(net, get_snd(B));
 
   // Performs operation.
   if (get_tag(B1) == NUM) {
@@ -1381,8 +1432,8 @@ __device__ void save_redexes(Net* net, TM *tm, u32 turn) {
     Pair R = tm->rbag.lo_buf[i % RLEN];
     Port x = get_fst(R);
     Port y = get_snd(R);
-    Port X = new_port(VAR, g_vars_alloc_1(net, tm));
-    Port Y = new_port(VAR, g_vars_alloc_1(net, tm));
+    Port X = new_port(VAR, g_vars_alloc_1(net));
+    Port Y = new_port(VAR, g_vars_alloc_1(net));
     vars_create(net, get_val(X), NONE);
     vars_create(net, get_val(Y), NONE);
     link_pair(net, tm, new_pair(X, x));
@@ -1417,8 +1468,8 @@ __device__ void load_redexes(Net* net, TM *tm, u32 turn) {
   for (u32 i = 0; i < RLEN; ++i) {
     Pair redex = atomicExch(&net->g_rbag_buf_A[bag * RLEN + i], 0);
     if (redex != 0) {
-      Port a = enter(net, tm, get_fst(redex));
-      Port b = enter(net, tm, get_snd(redex));
+      Port a = enter(net, get_fst(redex));
+      Port b = enter(net, get_snd(redex));
       #ifdef DEBUG
       if (is_local(a) || is_local(b)) printf("[%04x] ERR LOAD_REDEXES\n", turn);
       #endif
@@ -1445,89 +1496,11 @@ __global__ void boot_redex(GNet* gnet, Pair redex) {
   }
 }
 
-/// Returns a λ-Encoded Ctr for a NIL: λt (t NIL)
-/// Should only be called within `inject_str`, as a previous call
-/// to `get_resources` is expected.
-__device__ Port nil_port(Net* net, TM* tm) {
-  u32 v1 = tm->vloc[0];
-
-  u32 n1 = tm->nloc[0];
-  u32 n2 = tm->nloc[1];
-
-  vars_create(net, v1, NONE);
-  Port var = new_port(VAR, v1);
-
-  node_create(net, n1, new_pair(new_port(NUM, new_u24(LIST_NIL)), var));
-  node_create(net, n2, new_pair(new_port(CON, n1), var));
-
-  return new_port(CON, n2);
-}
-
-/// Returns a λ-Encoded Ctr for a CONS: λt (((t CONS) head) tail)
-/// Should only be called within `inject_str`, as a previous call
-/// to `get_resources` is expected.
-/// The `char_idx` parameter is used to offset the vloc and nloc
-/// allocations, otherwise they would conflict with each other on
-/// subsequent calls.
-__device__ Port cons_port(Net* net, TM* tm, Port head, Port tail, u32 char_idx) {
-  u32 v1 = tm->vloc[1 + char_idx];
-
-  u32 n1 = tm->nloc[2 + char_idx * 4 + 0];
-  u32 n2 = tm->nloc[2 + char_idx * 4 + 1];
-  u32 n3 = tm->nloc[2 + char_idx * 4 + 2];
-  u32 n4 = tm->nloc[2 + char_idx * 4 + 3];
-
-  vars_create(net, v1, NONE);
-  Port var = new_port(VAR, v1);
-
-  node_create(net, n1, new_pair(tail, var));
-  node_create(net, n2, new_pair(head, new_port(CON, n1)));
-  node_create(net, n3, new_pair(new_port(NUM, new_u24(LIST_CONS)), new_port(CON, n2)));
-  node_create(net, n4, new_pair(new_port(CON, n3), var));
-
-  return new_port(CON, n4);
-}
-
-// Converts a UTF-32 (truncated to 24 bits) string to a Port.
-// Since unicode scalars can fit in 21 bits, HVM's u24
-// integers can contain any unicode scalar value.
-// Encoding:
-// - λt (t NIL)
-// - λt (((t CONS) head) tail)
-__device__ Port inject_str(Net* net, TM* tm, Str *str) {
-  // Allocate all resources up front:
-  // - NIL needs  2 nodes & 1 var
-  // - CONS needs 4 nodes & 1 var
-  u32 len = str->text_len;
-  if (!get_resources(net, tm, 0, 2 + 4 * len, 1 + len)) {
-    printf("inject_str: failed to get resources\n");
-    return new_port(ERA, 0);
-  }
-
-  Port port = nil_port(net, tm);
-
-  for (u32 i = 0; i < len; i++) {
-    Port chr = new_port(NUM, new_u24(str->text_buf[len - i - 1]));
-    port = cons_port(net, tm, chr, port, i);
-  }
-
-  return port;
-}
-
-__global__ void make_str_port(GNet* gnet, Str *str, Port* ret) {
-  if (GID() == 0) {
-    TM tm;
-    Net net = vnet_new(gnet, NULL, gnet->turn);
-    *ret = inject_str(&net, &tm, str);
-  }
-}
-
 // Creates a node.
 __global__ void make_node(GNet* gnet, Tag tag, Port fst, Port snd, Port* ret) {
   if (GID() == 0) {
-    TM tm;
     Net net = vnet_new(gnet, NULL, gnet->turn);
-    u32 loc = g_node_alloc_1(&net, &tm);
+    u32 loc = g_node_alloc_1(&net);
     node_create(&net, loc, new_pair(fst, snd));
     *ret = new_port(tag, loc);
   }
@@ -1793,10 +1766,10 @@ __global__ void initialize(GNet* gnet) {
   gnet->vars_put[GID()] = 0;
   gnet->rbag_pos[GID()] = 0;
   for (u32 i = 0; i < RLEN; ++i) {
-    gnet->rbag_buf_A[G_RBAG_LEN / TPG * GID()] = 0;
+    gnet->rbag_buf_A[G_RBAG_LEN / TPG * GID() + i] = 0;
   }
   for (u32 i = 0; i < RLEN; ++i) {
-    gnet->rbag_buf_B[G_RBAG_LEN / TPG * GID()] = 0;
+    gnet->rbag_buf_B[G_RBAG_LEN / TPG * GID() + i] = 0;
   }
 }
 
@@ -1912,365 +1885,12 @@ Port gnet_make_node(GNet* gnet, Tag tag, Port fst, Port snd) {
   return ret;
 }
 
-// Readback
-// --------
-
-// Reads back a λ-Encoded constructor from device to host.
-// Encoding: λt ((((t TAG) arg0) arg1) ...)
-Ctr gnet_readback_ctr(GNet* gnet, Port port) {
-  Ctr ctr;
-  ctr.tag = -1;
-  ctr.args_len = 0;
-
-  // Loads root lambda
-  Port lam_port = gnet_expand(gnet, port);
-  if (get_tag(lam_port) != CON) return ctr;
-  Pair lam_node = gnet_node_load(gnet, get_val(lam_port));
-
-  // Loads first application
-  Port app_port = gnet_expand(gnet, get_fst(lam_node));
-  if (get_tag(app_port) != CON) return ctr;
-  Pair app_node = gnet_node_load(gnet, get_val(app_port));
-
-  // Loads first argument (as the tag)
-  Port arg_port = gnet_expand(gnet, get_fst(app_node));
-  if (get_tag(arg_port) != NUM) return ctr;
-  ctr.tag = get_u24(get_val(arg_port));
-
-  // Loads remaining arguments
-  while (TRUE) {
-    app_port = gnet_expand(gnet, get_snd(app_node));
-    if (get_tag(app_port) != CON) break;
-    app_node = gnet_node_load(gnet, get_val(app_port));
-    arg_port = gnet_expand(gnet, get_fst(app_node));
-    ctr.args_buf[ctr.args_len++] = arg_port;
-  }
-
-  return ctr;
-}
-
-// Reads back a UTF-32 (truncated to 24 bits) string.
-// Since unicode scalars can fit in 21 bits, HVM's u24
-// integers can contain any unicode scalar value.
-// Encoding:
-// - λt (t NIL)
-// - λt (((t CONS) head) tail)
-Str gnet_inject_str(GNet* gnet, Port port) {
-  // Result
-  Str str;
-  str.text_len = 0;
-
-  // Readback loop
-  while (TRUE) {
-    // Normalizes the net
-    gnet_normalize(gnet);
-
-    // Reads the λ-Encoded Ctr
-    Ctr ctr = gnet_readback_ctr(gnet, gnet_peek(gnet, port));
-
-    // Reads string layer
-    switch (ctr.tag) {
-      case LIST_NIL: {
-        break;
-      }
-      case LIST_CONS: {
-        if (ctr.args_len != 2) break;
-        if (get_tag(ctr.args_buf[0]) != NUM) break;
-        if (str.text_len >= 256) { printf("ERROR: for now, HVM can only readback strings of length <256."); break; }
-
-        str.text_buf[str.text_len++] = get_u24(get_val(ctr.args_buf[0]));
-        gnet_boot_redex(gnet, new_pair(ctr.args_buf[1], ROOT));
-        port = ROOT;
-        continue;
-      }
-    }
-    break;
-  }
-
-  str.text_buf[str.text_len] = '\0';
-
-  return str;
-}
-
-// Converts a UTF-32 (truncated to 24 bits) string to a Port.
-// Since unicode scalars can fit in 21 bits, HVM's u24
-// integers can contain any unicode scalar value.
-// Encoding:
-// - λt (t NIL)
-// - λt (((t CONS) head) tail)
-Port gnet_make_str(GNet* gnet, Str *str) {
-  Port* d_ret;
-  cudaMalloc(&d_ret, sizeof(Port));
-
-  Str* cu_str;
-  cudaMalloc(&cu_str, sizeof(Str));
-  cudaMemcpy(cu_str, str, sizeof(Str), cudaMemcpyHostToDevice);
-
-  make_str_port<<<1,1>>>(gnet, cu_str, d_ret);
-
-  Port ret;
-  cudaMemcpy(&ret, d_ret, sizeof(Port), cudaMemcpyDeviceToHost);
-  cudaFree(d_ret);
-
-  return ret;
-}
-
-// Primitive IO Fns
-// -----------------
-
-// Open file pointers. Indices into this array
-// are used as "file descriptors".
-// Indices 0 1 and 2 are reserved.
-// - 0 -> stdin
-// - 1 -> stdout
-// - 2 -> stderr
-static FILE* FILE_POINTERS[256];
-
-// Converts a NUM port (file descriptor) to file pointer.
-FILE* readback_file(Port port) {
-  if (get_tag(port) != NUM) {
-    fprintf(stderr, "non-num where file descriptor was expected: %i\n", get_tag(port));
-    return NULL;
-  }
-
-  u32 idx = get_u24(get_val(port));
-
-  if (idx == 0) return stdin;
-  if (idx == 1) return stdout;
-  if (idx == 2) return stderr;
-
-  FILE* fp = FILE_POINTERS[idx];
-  if (fp == NULL) {
-    fprintf(stderr, "invalid file descriptor\n");
-    return NULL;
-  }
-
-  return fp;
-}
-
-// Reads a single char from `argm`.
-Port io_read_char(GNet* gnet, Port argm) {
-  FILE* fp = readback_file(gnet_peek(gnet, argm));
-  if (fp == NULL) {
-    return new_port(ERA, 0);
-  }
-
-  /// Read a string.
-  Str str;
-
-  str.text_buf[0] = fgetc(fp);
-  str.text_buf[1] = 0;
-  str.text_len = 1;
-
-  return gnet_make_str(gnet, &str);
-}
-
-// Reads from `argm` at most 255 characters or until a newline is seen.
-Port io_read_line(GNet* gnet, Port argm) {
-  FILE* fp = readback_file(gnet_peek(gnet, argm));
-  if (fp == NULL) {
-    fprintf(stderr, "io_read_line: invalid file descriptor\n");
-    return new_port(ERA, 0);
-  }
-
-  /// Read a string.
-  Str str;
-
-  if (fgets(str.text_buf, sizeof(str.text_buf), fp) == NULL) {
-    fprintf(stderr, "io_read_line: failed to read\n");
-  }
-  str.text_len = strlen(str.text_buf);
-
-  // Strip any trailing newline.
-  if (str.text_len > 0 && str.text_buf[str.text_len - 1] == '\n') {
-    str.text_buf[str.text_len] = 0;
-    str.text_len--;
-  }
-
-  // Convert it to a port.
-  return gnet_make_str(gnet, &str);
-}
-
-// Opens a file with the provided mode.
-// `argm` is a tuple (CON node) of the
-// file name and mode as strings.
-Port io_open_file(GNet* gnet, Port argm) {
-  if (get_tag(gnet_peek(gnet, argm)) != CON) {
-    fprintf(stderr, "io_open_file: expected tuple\n");
-    return new_port(ERA, 0);
-  }
-
-  Pair args = gnet_node_load(gnet, get_val(argm));
-  Str name = gnet_inject_str(gnet, get_fst(args));
-  Str mode = gnet_inject_str(gnet, get_snd(args));
-
-  for (u32 fd = 3; fd < sizeof(FILE_POINTERS); fd++) {
-    if (FILE_POINTERS[fd] == NULL) {
-      FILE_POINTERS[fd] = fopen(name.text_buf, mode.text_buf);
-      return new_port(NUM, new_u24(fd));
-    }
-  }
-
-  fprintf(stderr, "io_open_file: too many open files\n");
-
-  return new_port(ERA, 0);
-}
-
-// Closes a file, reclaiming the file descriptor.
-Port io_close_file(GNet* gnet, Port argm) {
-  FILE* fp = readback_file(gnet_peek(gnet, argm));
-  if (fp == NULL) {
-    fprintf(stderr, "io_close_file: failed to close\n");
-    return new_port(ERA, 0);
-  }
-
-  int err = fclose(fp) != 0;
-  if (err != 0) {
-    fprintf(stderr, "io_close_file: failed to close: %i\n", err);
-    return new_port(ERA, 0);
-  }
-
-  FILE_POINTERS[get_u24(get_val(argm))] = NULL;
-
-  return new_port(ERA, 0);
-}
-
-// Writes a string to a file.
-// `argm` is a tuple (CON node) of the
-// file descriptor and string to write.
-Port io_write(GNet* gnet, Port argm) {
-  if (get_tag(gnet_peek(gnet, argm)) != CON) {
-    fprintf(stderr, "io_write: expected tuple, but got %u", get_tag(gnet_peek(gnet, argm)));
-    return new_port(ERA, 0);
-  }
-
-  Pair args = gnet_node_load(gnet, get_val(argm));
-  FILE* fp = readback_file(gnet_peek(gnet, get_fst(args)));
-  Str str = gnet_inject_str(gnet, get_snd(args));
-
-  if (fp == NULL) {
-    fprintf(stderr, "io_write: invalid file descriptor\n");
-    return new_port(ERA, 0);
-  }
-
-  if (fputs(str.text_buf, fp) == EOF) {
-    fprintf(stderr, "io_write: failed to write\n");
-  }
-
-  return new_port(ERA, 0);
-}
-
-// Returns the current time as a tuple of the high
-// and low 24 bits of a 48-bit nanosecond timestamp.
-Port io_get_time(GNet* gnet, Port argm) {
-  // Get the current time in nanoseconds
-  u64 time_ns = time64();
-  // Encode the time as a 64-bit unsigned integer
-  u32 time_hi = (u32)(time_ns >> 24) & 0xFFFFFFF;
-  u32 time_lo = (u32)(time_ns & 0xFFFFFFF);
-  // Return the encoded time
-  return gnet_make_node(gnet, CON, new_port(NUM, new_u24(time_hi)), new_port(NUM, new_u24(time_lo)));
-}
-
-// Sleeps.
-// `argm` is a tuple (CON node) of the high and low
-// 24 bits for a 48-bit duration in nanoseconds.
-Port io_sleep(GNet* gnet, Port argm) {
-  // Get the sleep duration node
-  Pair dur_node = gnet_node_load(gnet, get_val(argm));
-  // Get the high and low 24-bit parts of the duration
-  u32 dur_hi = get_u24(get_val(get_fst(dur_node)));
-  u32 dur_lo = get_u24(get_val(get_snd(dur_node)));
-  // Combine into a 48-bit duration in nanoseconds
-  u64 dur_ns = (((u64)dur_hi) << 24) | dur_lo;
-  // Sleep for the specified duration
-  struct timespec ts;
-  ts.tv_sec = dur_ns / 1000000000;
-  ts.tv_nsec = dur_ns % 1000000000;
-  nanosleep(&ts, NULL);
-  // Return an eraser
-  return new_port(ERA, 0);
-}
-
-// Monadic IO Evaluator
-// ---------------------
-
-// Runs an IO computation.
-void do_run_io(GNet* gnet, Book* book, Port port) {
-  // IO loop
-  while (TRUE) {
-    // Normalizes the net
-    gnet_normalize(gnet);
-
-    // Reads the λ-Encoded Ctr
-    Ctr ctr = gnet_readback_ctr(gnet, gnet_peek(gnet, port));
-
-    // Checks if IO Magic Number is a CON
-    if (get_tag(ctr.args_buf[0]) != CON) {
-      break;
-    }
-
-    // Checks the IO Magic Number
-    Pair io_magic = gnet_node_load(gnet, get_val(ctr.args_buf[0]));
-    //printf("%08x %08x\n", get_u24(get_val(get_fst(io_magic))), get_u24(get_val(get_snd(io_magic))));
-    if (get_val(get_fst(io_magic)) != new_u24(IO_MAGIC_0) || get_val(get_snd(io_magic)) != new_u24(IO_MAGIC_1)) {
-      break;
-    }
-
-    switch (ctr.tag) {
-      case IO_CALL: {
-        Str  func = gnet_inject_str(gnet, ctr.args_buf[1]);
-        FFn* ffn  = NULL;
-        // FIXME: optimize this linear search
-        for (u32 fid = 0; fid < book->ffns_len; ++fid) {
-          if (strcmp(func.text_buf, book->ffns_buf[fid].name) == 0) {
-            ffn = &book->ffns_buf[fid];
-            break;
-          }
-        }
-        if (ffn == NULL) {
-          printf("FOUND NOTHING when looking for %s\n", func.text_buf);
-          break;
-        }
-
-        Port argm = ctr.args_buf[2];
-        Port cont = ctr.args_buf[3];
-        Port ret  = ffn->func(gnet, argm);
-
-        Port p = gnet_make_node(gnet, CON, ret, ROOT);
-        gnet_boot_redex(gnet, new_pair(p, cont));
-        port = ROOT;
-        continue;
-      }
-      case IO_DONE: {
-        printf("DONE\n");
-        break;
-      }
-    }
-    break;
-  }
-}
-
 // Book Loader
 // -----------
 
-// TODO: initialize ffns_len with the builtin ffns
-void book_init(Book* book) {
-  book->ffns_len = 7;
-  book->ffns_buf[0] = (FFn){"READ_CHAR", io_read_char};
-  book->ffns_buf[1] = (FFn){"READ_LINE", io_read_line};
-  book->ffns_buf[2] = (FFn){"OPEN_FILE", io_open_file};
-  book->ffns_buf[3] = (FFn){"CLOSE_FILE", io_close_file};
-  book->ffns_buf[4] = (FFn){"WRITE", io_write};
-  book->ffns_buf[5] = (FFn){"GET_TIME", io_get_time};
-  book->ffns_buf[6] = (FFn){"SLEEP", io_sleep};
-}
-
-void book_load(Book* book, u32* buf) {
+bool book_load(Book* book, u32* buf) {
   // Reads defs_len
   book->defs_len = *buf++;
-
-  //printf("len %d\n", book->defs_len);
 
   // Parses each def
   for (u32 i = 0; i < book->defs_len; ++i) {
@@ -2292,6 +1912,16 @@ void book_load(Book* book, u32* buf) {
     def->node_len = *buf++;
     def->vars_len = *buf++;
 
+    if (def->rbag_len > L_NODE_LEN/TPB) {
+      fprintf(stderr, "def '%s' has too many redexes: %u\n", def->name, def->rbag_len);
+      return false;
+    }
+
+    if (def->node_len > L_NODE_LEN/TPB) {
+      fprintf(stderr, "def '%s' has too many nodes: %u\n", def->name, def->node_len);
+      return false;
+    }
+
     // Reads root
     def->root = *buf++;
 
@@ -2303,6 +1933,8 @@ void book_load(Book* book, u32* buf) {
     memcpy(def->node_buf, buf, 8*def->node_len);
     buf += def->node_len * 2;
   }
+
+  return true;
 }
 
 // Debug Printing
@@ -2358,10 +1990,10 @@ __device__ void print_rbag(Net* net, TM* tm) {
     printf("%04X | %s | %s | hi | (%s %s) ~ (%s %s)\n", i,
       show_port(get_fst(redex)).x,
       show_port(get_snd(redex)).x,
-      show_port(peek(net, tm, get_fst(node1))).x,
-      show_port(peek(net, tm, get_snd(node1))).x,
-      show_port(peek(net, tm, get_fst(node2))).x,
-      show_port(peek(net, tm, get_snd(node2))).x);
+      show_port(peek(net, get_fst(node1))).x,
+      show_port(peek(net, get_snd(node1))).x,
+      show_port(peek(net, get_fst(node2))).x,
+      show_port(peek(net, get_snd(node2))).x);
   }
   for (u32 i = 0; i < tm->rbag.lo_end; ++i) {
     Pair redex = tm->rbag.lo_buf[i%RLEN];
@@ -2370,10 +2002,10 @@ __device__ void print_rbag(Net* net, TM* tm) {
     printf("%04X | %s | %s | hi | (%s %s) ~ (%s %s)\n", i,
       show_port(get_fst(redex)).x,
       show_port(get_snd(redex)).x,
-      show_port(peek(net, tm, get_fst(node1))).x,
-      show_port(peek(net, tm, get_snd(node1))).x,
-      show_port(peek(net, tm, get_fst(node2))).x,
-      show_port(peek(net, tm, get_snd(node2))).x);
+      show_port(peek(net, get_fst(node1))).x,
+      show_port(peek(net, get_snd(node1))).x,
+      show_port(peek(net, get_fst(node2))).x,
+      show_port(peek(net, get_snd(node2))).x);
   }
   printf("==== | ============ | ============\n");
 }
@@ -2403,6 +2035,11 @@ __device__ void pretty_print_numb(Numb word) {
   switch (get_typ(word)) {
     case TY_SYM: {
       switch (get_sym(word)) {
+        // types
+        case TY_U24: printf("[u24]"); break;
+        case TY_I24: printf("[i24]"); break;
+        case TY_F24: printf("[f24]"); break;
+        // operations
         case OP_ADD: printf("[+]"); break;
         case OP_SUB: printf("[-]"); break;
         case FP_SUB: printf("[:-]"); break;
@@ -2444,7 +2081,7 @@ __device__ void pretty_print_numb(Numb word) {
       } else if (isnan(get_f24(word))) {
         printf("+NaN");
       } else {
-        printf("%f", get_f24(word));
+        printf("%.7e", get_f24(word));
       }
       break;
     }
@@ -2477,7 +2114,7 @@ __device__ void pretty_print_numb(Numb word) {
 }
 
 __device__ void pretty_print_port(Net* net, Port port) {
-  Port stack[256];
+  Port stack[4096];
   stack[0] = port;
   u32 len = 1;
   while (len > 0) {
@@ -2647,7 +2284,7 @@ __global__ void print_result(GNet* gnet) {
   Net net = vnet_new(gnet, NULL, gnet->turn);
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     printf("Result: ");
-    pretty_print_port(&net, enter(&net, NULL, ROOT));
+    pretty_print_port(&net, enter(&net, ROOT));
     printf("\n");
   }
 }
@@ -2669,16 +2306,19 @@ __global__ void print_result(GNet* gnet) {
 // Main
 // ----
 
+#ifdef IO
+void do_run_io(GNet* gnet, Book* book, Port port);
+#endif
 
 extern "C" void hvm_cu(u32* book_buffer) {
-  // Start the timer
-  clock_t start = clock();
-
   // Loads the Book
   Book* book = (Book*)malloc(sizeof(Book));
   if (book_buffer) {
-    book_init(book);
-    book_load(book, (u32*)book_buffer);
+    if (!book_load(book, (u32*)book_buffer)) {
+      fprintf(stderr, "failed to load book\n");
+
+      return;
+    }
     cudaMemcpyToSymbol(BOOK, book, sizeof(Book));
   }
 
@@ -2688,11 +2328,17 @@ extern "C" void hvm_cu(u32* book_buffer) {
   // Creates a new GNet
   GNet* gnet = gnet_create();
 
+  // Start the timer
+  clock_t start = clock();
+
   // Boots root redex, to expand @main
   gnet_boot_redex(gnet, new_pair(new_port(REF, 0), ROOT));
 
-  // Normalizes and runs IO
+  #ifdef IO
   do_run_io(gnet, book, ROOT);
+  #else
+  gnet_normalize(gnet);
+  #endif
 
   cudaDeviceSynchronize();
 
